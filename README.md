@@ -10,9 +10,9 @@
 
 1. В Portainer создайте stack из `compose.portainer.yaml` (через Git repository или вставив содержимое).
 2. В переменных stack задайте `BOT_TOKEN` из BotFather. Токен остаётся на сервере, в GitHub Secrets его добавлять не нужно.
-3. На сервере уже должна существовать Docker-сеть **`vpn`**, в которой контейнер Throne доступен по имени **`throne`** на SOCKS-порту **2080**.
+3. На сервере должны существовать Docker-сети **`vpn`** и **`proxy`**. Throne подключён к `vpn` и доступен по имени **`throne`** на SOCKS-порту **2080**; Nginx Proxy Manager подключён к `proxy`. Бот подключается к обеим сетям.
 4. `TELEGRAM_PROXY` по умолчанию — `socks5h://throne:2080`. `socks5h` передаёт DNS-разрешение прокси. Если у Throne HTTP-порт, укажите `http://throne:ПОРТ`. Для запуска без прокси используйте обычный `compose.yaml`.
-5. Разверните stack. API публикуется на хосте только как `127.0.0.1:8787`; настройте HTTPS reverse proxy или SSH-туннель для доступа Partizan, как описано ниже. Другой контейнер reverse proxy в сети `vpn` может обращаться к `partizan-telegram-bot:8787`.
+5. Разверните stack. В Nginx Proxy Manager укажите схему `http`, целевой хост `partizan-telegram-bot`, порт `8787`; соединение идёт по сети `proxy`. Для поддомена настройте DNS и SSL-сертификат с принудительным HTTPS. Проверка: `https://ваш-поддомен/health` возвращает `{"ok":true}`. API также публикуется на хосте только как `127.0.0.1:8787`, что позволяет использовать SSH-туннель, как описано ниже.
 6. Создайте webhook обновления stack в Portainer. Его HTTPS-адрес добавьте в репозитории GitHub: **Settings → Secrets and variables → Actions → New repository secret → `PORTAINER_WEBHOOK_URL`**. Адрес не публикуйте: он разрешает запуск обновления.
 
 Workflow [docker.yaml](.github/workflows/docker.yaml) выполняется при push в `main` и вручную из Actions:
