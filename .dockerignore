@@ -1,0 +1,8 @@
+.git
+.env
+.env.*
+data
+*.sqlite3*
+__pycache__
+.venv
+.coverage
