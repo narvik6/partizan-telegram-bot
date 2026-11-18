@@ -6,6 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HTTP_PORT=8787 \
     STATE_FILE=/data/bot.sqlite3
 WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 RUN install -d -o 10001 -g 10001 /data
 COPY --chown=10001:10001 bot.py /app/bot.py
 USER 10001:10001
@@ -14,7 +16,7 @@ STOPSIGNAL SIGINT
 CMD ["python", "bot.py"]
 
 FROM base AS test
-COPY --chown=10001:10001 test_bot.py /app/test_bot.py
+COPY --chown=10001:10001 test_*.py /app/
 CMD ["python", "-W", "error::ResourceWarning", "-m", "unittest", "-v"]
 
 FROM base AS runtime

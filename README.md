@@ -1,7 +1,43 @@
 # Partizan Telegram Bot
 
 Небольшой сервер доставки уведомлений о контроле присутствия для Partizan.
-Основной запуск — **Docker Compose**. В контейнере Python 3.13, только стандартная библиотека; pip и отдельный сервер базы данных не нужны. Также сохранён запуск напрямую Python 3.10+.
+Основной запуск — **Docker Compose**. В контейнере Python 3.13 и `requests[socks]` для HTTP/SOCKS-прокси; зависимости устанавливаются при сборке образа. Отдельный сервер базы данных не нужен. Также сохранён запуск напрямую Python 3.10+.
+
+## Готовый образ: Portainer, Throne и автоматические обновления
+
+Образ: **`ghcr.io/narvik6/partizan-telegram-bot:latest`**, архитектуры `linux/amd64` и `linux/arm64`.
+Для сервера с Portainer используйте [compose.portainer.yaml](compose.portainer.yaml): в нём нет `build`, исходники и Python на сервере не нужны.
+
+1. В Portainer создайте stack из `compose.portainer.yaml` (через Git repository или вставив содержимое).
+2. В переменных stack задайте `BOT_TOKEN` из BotFather. Токен остаётся на сервере, в GitHub Secrets его добавлять не нужно.
+3. На сервере уже должна существовать Docker-сеть **`vpn`**, в которой контейнер Throne доступен по имени **`throne`** на SOCKS-порту **2080**.
+4. `TELEGRAM_PROXY` по умолчанию — `socks5h://throne:2080`. `socks5h` передаёт DNS-разрешение прокси. Если у Throne HTTP-порт, укажите `http://throne:ПОРТ`. Для запуска без прокси используйте обычный `compose.yaml`.
+5. Разверните stack. API публикуется на хосте только как `127.0.0.1:8787`; настройте HTTPS reverse proxy или SSH-туннель для доступа Partizan, как описано ниже. Другой контейнер reverse proxy в сети `vpn` может обращаться к `partizan-telegram-bot:8787`.
+6. Создайте webhook обновления stack в Portainer. Его HTTPS-адрес добавьте в репозитории GitHub: **Settings → Secrets and variables → Actions → New repository secret → `PORTAINER_WEBHOOK_URL`**. Адрес не публикуйте: он разрешает запуск обновления.
+
+Workflow [docker.yaml](.github/workflows/docker.yaml) выполняется при push в `main` и вручную из Actions:
+
+```text
+тесты → сборка amd64/arm64 → публикация GHCR → POST webhook Portainer
+```
+
+Pull request запускает только тесты, без публикации и обновления сервера. Без секрета образ публикуется, webhook пропускается. Для GHCR используется встроенный `GITHUB_TOKEN`, отдельный токен публикации не нужен. Теги: `latest` и `sha-<полный commit>` для возврата к конкретной версии.
+
+При первой публикации проверьте видимость package в GitHub: **Packages → partizan-telegram-bot → Package settings → Change visibility → Public**. Публичность репозитория не следует считать подтверждением публичности образа. Публичный образ скачивается сервером без входа в GHCR.
+
+Portainer должен скачивать новый образ при redeploy (`pullimage=false` в webhook использовать нельзя). Ответ webhook означает принятие запроса: окончательное состояние контейнера смотрите в Portainer. Состояние SQLite остаётся в volume того же stack; не удаляйте volume при обновлении. Запускайте одну копию бота с этим токеном.
+
+В документации Portainer stack webhook относится к Business Edition. Если друг уже использует подходящий webhook, менять его схему не требуется. Без доступного webhook можно обновлять вручную: `docker compose -f compose.portainer.yaml pull` и затем `docker compose -f compose.portainer.yaml up -d` с переменными stack в окружении.
+
+[Публикация образов GitHub Actions](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images) · [Portainer stack webhooks](https://docs.portainer.io/user/docker/stacks/webhooks)
+
+## Прокси
+
+`TELEGRAM_PROXY` задаёт прокси только для запросов к Telegram и имеет приоритет. Поддерживаются `http://`, `https://`, `socks5://`, `socks5h://`. Если он не задан, библиотека учитывает стандартные `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (и варианты в нижнем регистре). Поэтому вариант друга с `ALL_PROXY=socks5://throne:2080` также поддерживается при отсутствии `TELEGRAM_PROXY`.
+
+Все обращения Telegram — проверка токена, long polling, администраторы и отправка сообщений — проходят через один настроенный маршрут. Ошибки не печатают токен или пароль прокси. При недоступности явно заданного прокси обхода напрямую нет. Локальный входящий API Partizan через него не отправляется.
+
+[Requests: HTTP/SOCKS-прокси](https://requests.readthedocs.io/en/stable/user/advanced/#proxies)
 
 ## Запуск в Docker
 
@@ -44,6 +80,8 @@ docker compose up -d --build
 ```bash
 python3 bot.py
 ```
+
+Перед первым прямым запуском создайте виртуальное окружение и установите зависимости: `python3 -m venv .venv`, `. .venv/bin/activate`, `python -m pip install -r requirements.txt`.
 
 При прямом запуске Ctrl+C завершает бота; `.env` получает права 0600 на Unix, состояние по умолчанию хранится в `data/bot.sqlite3`.
 
@@ -123,10 +161,10 @@ docker build --target test -t partizan-telegram-bot:test .
 docker run --rm --network none --read-only --tmpfs /tmp:size=16m partizan-telegram-bot:test
 ```
 
-Либо без Docker: `python3 -m unittest -v`.
+Либо без Docker после установки `requirements.txt`: `python3 -m unittest -v`.
 
 Проверяются регистрация личного чата/группы, права администратора, сохранение состояния,
 настоящие локальные HTTP-запросы, ограничение получателя, ошибки доставки и дедупликация.
-Тесты не обращаются в Telegram и никому не отправляют сообщения.
+Дополнительно проверяется реальный локальный HTTP-прокси, HTTPS CONNECT, SOCKS5 с передачей имени хоста прокси, приоритет настроек и сохранение Telegram retry_after. Тесты не обращаются в Telegram и никому не отправляют сообщения.
 
 Протокол Telegram: [официальный Bot API](https://core.telegram.org/bots/api).

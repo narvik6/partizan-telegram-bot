@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram delivery for Partizan. Python 3.10+, standard library only."""
+"""Telegram delivery for Partizan. Python 3.10+ with requests[socks]."""
 from __future__ import annotations
 
 import json
@@ -12,8 +12,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+
+import requests
 
 
 class TelegramError(Exception):
@@ -41,32 +42,49 @@ def load_env(path: Path) -> None:
 
 
 class Telegram:
-    def __init__(self, token: str):
+    API_URL = "https://api.telegram.org"
+
+    def __init__(self, token: str, proxy: str | None = None):
         self._token = token
+        proxy = (proxy if proxy is not None else os.getenv("TELEGRAM_PROXY", "")).strip()
+        if proxy:
+            try:
+                parsed = urlsplit(proxy)
+                valid = (parsed.scheme in {"http", "https", "socks5", "socks5h"}
+                         and parsed.hostname and parsed.port
+                         and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("TELEGRAM_PROXY: укажите http(s)://host:port или socks5(h)://host:port")
+        # Explicit per-request proxies override environment settings. Without
+        # TELEGRAM_PROXY, requests honors HTTPS_PROXY / ALL_PROXY / NO_PROXY.
+        self._proxies = {"http": proxy, "https": proxy} if proxy else None
 
     def call(self, method: str, **payload):
         # Never include the request URL, token or message body in exceptions.
-        request = Request(
-            f"https://api.telegram.org/bot{self._token}/{method}",
-            json.dumps(payload).encode(),
-            {"Content-Type": "application/json"},
-        )
         try:
-            with urlopen(request, timeout=35 if method == "getUpdates" else 8) as response:
-                data = json.loads(response.read(2_000_000))
-        except HTTPError as error:
-            try:
-                with error:
-                    data = json.loads(error.read(64_000))
-                retry = int(data.get("parameters", {}).get("retry_after", 0))
-            except (ValueError, TypeError):
-                retry = 0
-            raise TelegramError(method, error.code, retry) from None
-        except (URLError, OSError, ValueError):
+            with requests.post(
+                f"{self.API_URL}/bot{self._token}/{method}", json=payload,
+                proxies=self._proxies, timeout=(8, 35 if method == "getUpdates" else 8),
+                allow_redirects=False, stream=True,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise TelegramError(method, response.status_code)
+                raw = bytearray()
+                for chunk in response.iter_content(64_000):
+                    raw.extend(chunk)
+                    if len(raw) > 2_000_000:
+                        raise ValueError("Response too large")
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("Expected an object")
+                if response.status_code != 200 or not data.get("ok"):
+                    raise TelegramError(method, int(data.get("error_code", response.status_code)),
+                                        int(data.get("parameters", {}).get("retry_after", 0)))
+                return data["result"]
+        except (requests.RequestException, OSError, ValueError, KeyError, TypeError):
             raise TelegramError(method) from None
-        if not data.get("ok"):
-            raise TelegramError(method, int(data.get("error_code", 0)))
-        return data["result"]
 
     def send(self, chat_id: int, text: str):
         return self.call("sendMessage", chat_id=chat_id, text=text,
