@@ -25,6 +25,8 @@ class TelegramError(Exception):
 def load_env(path: Path) -> None:
     if not path.exists():
         return
+    if os.name != "nt":
+        path.chmod(0o600)
     for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
