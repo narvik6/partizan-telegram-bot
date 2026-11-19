@@ -3,7 +3,13 @@ services:
     image: ghcr.io/narvik6/partizan-telegram-bot:latest
     pull_policy: always
     environment:
-      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in Portainer stack environment}
+      BOT_TOKEN: ${BOT_TOKEN:-}
+      TELEGRAM_ENABLED: ${TELEGRAM_ENABLED:-auto}
+      MAIL_HOST: ${MAIL_HOST:-imap.gmail.com}
+      MAIL_PORT: "993"
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      SSO_MAIL_SENDER: ${SSO_MAIL_SENDER:-}
       TELEGRAM_PROXY: ${TELEGRAM_PROXY:-socks5h://throne:2080}
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: "8787"
@@ -17,6 +23,7 @@ services:
       proxy:
         aliases:
           - partizan-telegram-bot
+          - partizan-backend
     restart: unless-stopped
     read_only: true
     tmpfs:

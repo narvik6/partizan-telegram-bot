@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Telegram delivery for Partizan. Python 3.10+ with requests[socks]."""
+"""Telegram delivery for partizan. Python 3.10+ with requests[socks]."""
 from __future__ import annotations
 
 import json
+import base64
+from phrases import generate, authorization_key
 import os
 import re
 import secrets
@@ -113,10 +115,17 @@ class Store:
 
     def connection_key(self, chat_id: int) -> str:
         with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO chats(chat_id,key) VALUES (?,?)",
-                            (chat_id, secrets.token_urlsafe(32)))
-            self.db.execute("UPDATE chats SET active=1 WHERE chat_id=?", (chat_id,))
-            return self.db.execute("SELECT key FROM chats WHERE chat_id=?", (chat_id,)).fetchone()[0]
+            old = self.db.execute("SELECT key FROM chats WHERE chat_id=?", (chat_id,)).fetchone()
+            if old and ' ' in old[0]:
+                self.db.execute("UPDATE chats SET active=1 WHERE chat_id=?", (chat_id,))
+                return old[0]
+            for _ in range(256):
+                key = generate()
+                if self.db.execute("SELECT 1 FROM chats WHERE key=?", (key,)).fetchone():
+                    continue
+                self.db.execute("INSERT INTO chats(chat_id,key,active) VALUES (?,?,1) ON CONFLICT(chat_id) DO UPDATE SET key=excluded.key,active=1", (chat_id, key))
+                return key
+            raise RuntimeError("Не удалось создать свободную фразу")
 
     def disable(self, chat_id: int) -> None:
         with self.lock, self.db:
@@ -193,7 +202,7 @@ class Bot:
             return
         private = chat["type"] == "private"
         if command == "/help" or (command == "/start" and not private):
-            self.telegram.send(chat["id"], "Partizan уведомляет о контроле присутствия. "
+            self.telegram.send(chat["id"], "partizan уведомляет о контроле присутствия. "
                                "Личный чат: /connect. Группа: администратор вводит /connect. "
                                "Отключить этот чат: /stop.")
             return
@@ -208,9 +217,8 @@ class Bot:
             return
         key = self.store.connection_key(chat["id"])
         label = "личного чата" if private else "группы"
-        credentials = (f"Код подключения {label} Partizan:\n\n{key}\n\n"
-                       "В приложении откройте настройки уведомлений, укажите адрес сервера бота "
-                       "и этот код, включите Telegram. Код разрешает отправку только в этот чат. "
+        credentials = (f"Фраза подключения {label} partizan:\n\n{key}\n\n"
+                       "В приложении откройте настройки, введите эту фразу и включите Telegram. Фраза разрешает отправку только в этот чат. "
                        "Для отключения: /stop в соответствующем чате.")
         if private:
             self.telegram.send(chat["id"], credentials)
@@ -221,9 +229,9 @@ class Bot:
                 if error.code not in {400, 403}:
                     raise
                 self.telegram.send(chat["id"], "Сначала откройте личный чат со мной и нажмите /start, "
-                                   "затем повторите /connect в группе. Код в группу не публикуется.")
+                                   "затем повторите /connect в группе. Фраза в группу не публикуется.")
                 return
-            self.telegram.send(chat["id"], "Код подключения группы отправлен администратору в личный чат.")
+            self.telegram.send(chat["id"], "Фраза подключения группы отправлен администратору в личный чат.")
 
     def poll(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -255,25 +263,31 @@ def handler_for(store: Store, telegram: Telegram):
         def log_message(self, *_):
             pass  # No authorization headers, keys or URLs in request logs.
 
-        def reply(self, code: int, **payload):
+        def reply(self, http_status: int, **payload):
             data = json.dumps(payload).encode()
-            self.send_response(code)
+            self.send_response(http_status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
         def do_GET(self):
-            if self.path == "/health":
+            if self.path in {"/health", "/"}:
                 self.reply(200, ok=True)
             else:
                 self.reply(404, ok=False)
 
         def do_POST(self):
-            if self.path != "/v1/attendance":
+            if self.path not in {"/v1/attendance", "/partizan_agent"}:
                 return self.reply(404, ok=False)
+            if telegram is None:
+                return self.reply(503, ok=False, error="telegram_disabled")
             authorization = self.headers.get("Authorization", "")
-            if not authorization.startswith("Bearer ") or not 20 <= len(authorization[7:]) <= 128:
+            if not authorization.startswith("Bearer ") or not 8 <= len(authorization[7:]) <= 256:
+                return self.reply(401, ok=False, error="invalid_key")
+            try:
+                key = authorization_key(authorization[7:])
+            except (ValueError, UnicodeError):
                 return self.reply(401, ok=False, error="invalid_key")
             if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
                 return self.reply(400, ok=False, error="expected_json")
@@ -296,7 +310,7 @@ def handler_for(store: Store, telegram: Telegram):
             except (ValueError, TypeError, KeyError):
                 return self.reply(400, ok=False, error="invalid_event")
             try:
-                duplicate = store.deliver(authorization[7:], event["event_id"],
+                duplicate = store.deliver(key, event["event_id"],
                                           event["title"] + "\n\n" + event["body"], telegram)
             except PermissionError:
                 return self.reply(401, ok=False, error="invalid_key")

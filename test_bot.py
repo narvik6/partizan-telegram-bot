@@ -1,4 +1,5 @@
 import concurrent.futures
+import base64
 import json
 import tempfile
 import threading
@@ -110,8 +111,11 @@ class DeliveryTests(SharedCase):
         if event is None:
             event = {"event_id": "event-1", "kind": "attendance_required",
                      "title": "Контроль присутствия", "body": "На вебинаре появился QR Pulse."}
+        credential = key or self.key
+        if ' ' in credential:
+            credential = 'phrase.' + base64.urlsafe_b64encode(credential.encode()).decode().rstrip('=')
         request = Request(self.url, json.dumps(event).encode(),
-                          {"Content-Type": "application/json", "Authorization": "Bearer " + (key or self.key)})
+                          {"Content-Type": "application/json", "Authorization": "Bearer " + credential})
         try:
             with urlopen(request, timeout=3) as response:
                 return response.status, json.loads(response.read())

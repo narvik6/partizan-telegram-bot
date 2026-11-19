@@ -1,4 +1,4 @@
-name: Test, publish and redeploy
+name: Test, publish and redeploy backend
 
 on:
   push:
