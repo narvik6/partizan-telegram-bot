@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 RUN install -d -o 10001 -g 10001 /data
-COPY --chown=10001:10001 bot.py backend.py mail_service.py imap_mail.py mail_auth.py phrases.py words_ru.txt /app/
+COPY --chown=10001:10001 bot.py pubsub.py backend.py mail_service.py imap_mail.py mail_auth.py phrases.py words_ru.txt /app/
 USER 10001:10001
 EXPOSE 8787
 STOPSIGNAL SIGINT

@@ -9,7 +9,7 @@ import sys
 import threading
 from pathlib import Path
 
-from bot import Bot, Server, Store, Telegram, TelegramError, handler_for, load_env
+from bot import Bot, Server, Store, Telegram, TelegramError, handler_for, load_env, maintain_messages
 from imap_mail import IMAPInbox
 from mail_service import MailError, MailService
 
@@ -97,6 +97,7 @@ def main():
     telegram_stop = threading.Event()
     if telegram:
         workers.append(threading.Thread(target=run_telegram, args=(telegram, store, telegram_stop), daemon=True))
+        workers.append(threading.Thread(target=maintain_messages,args=(telegram,store,telegram_stop),daemon=True))
     for worker in workers:
         worker.start()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

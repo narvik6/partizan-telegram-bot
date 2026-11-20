@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-import base64
-from phrases import generate, authorization_key
+from pubsub import Store, SHARED_KINDS, PERSONAL_KINDS
 import os
 import re
-import secrets
-import sqlite3
 import sys
 import threading
 import time
@@ -88,90 +85,9 @@ class Telegram:
         except (requests.RequestException, OSError, ValueError, KeyError, TypeError):
             raise TelegramError(method) from None
 
-    def send(self, chat_id: int, text: str):
+    def send(self, chat_id: int, text: str, **options):
         return self.call("sendMessage", chat_id=chat_id, text=text,
-                         link_preview_options={"is_disabled": True})
-
-
-class Store:
-    def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        os.close(descriptor)
-        if os.name != "nt":
-            path.chmod(0o600)
-        self.lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False)
-        with self.db:
-            self.db.executescript("""
-                CREATE TABLE IF NOT EXISTS chats (
-                    chat_id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1);
-                CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value INTEGER);
-                CREATE TABLE IF NOT EXISTS sent (
-                    chat_id INTEGER, event_id TEXT, sent_at REAL,
-                    PRIMARY KEY(chat_id, event_id));
-            """)
-
-    def connection_key(self, chat_id: int) -> str:
-        with self.lock, self.db:
-            old = self.db.execute("SELECT key FROM chats WHERE chat_id=?", (chat_id,)).fetchone()
-            if old and ' ' in old[0]:
-                self.db.execute("UPDATE chats SET active=1 WHERE chat_id=?", (chat_id,))
-                return old[0]
-            for _ in range(256):
-                key = generate()
-                if self.db.execute("SELECT 1 FROM chats WHERE key=?", (key,)).fetchone():
-                    continue
-                self.db.execute("INSERT INTO chats(chat_id,key,active) VALUES (?,?,1) ON CONFLICT(chat_id) DO UPDATE SET key=excluded.key,active=1", (chat_id, key))
-                return key
-            raise RuntimeError("Не удалось создать свободную фразу")
-
-    def disable(self, chat_id: int) -> None:
-        with self.lock, self.db:
-            self.db.execute("UPDATE chats SET active=0 WHERE chat_id=?", (chat_id,))
-
-    def move_chat(self, old: int, new: int) -> None:
-        with self.lock, self.db:
-            self.db.execute("UPDATE OR IGNORE chats SET chat_id=? WHERE chat_id=?", (new, old))
-            self.db.execute("UPDATE OR IGNORE sent SET chat_id=? WHERE chat_id=?", (new, old))
-
-    def offset(self) -> int:
-        with self.lock:
-            row = self.db.execute("SELECT value FROM meta WHERE name='offset'").fetchone()
-            return int(row[0]) if row else 0
-
-    def advance(self, update_id: int) -> None:
-        with self.lock, self.db:
-            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('offset',?)", (update_id + 1,))
-
-    def deliver(self, key: str, event_id: str, text: str, telegram: Telegram) -> bool:
-        # Serialize the check + delivery so concurrent HTTP retries do not
-        # produce duplicate messages. Telegram acknowledgements are persisted.
-        with self.lock:
-            row = self.db.execute("SELECT chat_id,active FROM chats WHERE key=?", (key,)).fetchone()
-            if not row:
-                raise PermissionError
-            chat_id, active = row
-            if not active:
-                raise LookupError
-            if self.db.execute("SELECT 1 FROM sent WHERE chat_id=? AND event_id=?",
-                               (chat_id, event_id)).fetchone():
-                return True
-            try:
-                telegram.send(chat_id, text)
-            except TelegramError as error:
-                if error.code == 403:
-                    self.disable(chat_id)
-                raise
-            with self.db:
-                self.db.execute("INSERT INTO sent VALUES (?,?,?)", (chat_id, event_id, time.time()))
-                self.db.execute("DELETE FROM sent WHERE sent_at<?", (time.time() - 86400,))
-            return False
-
-    def close(self) -> None:
-        with self.lock:
-            self.db.close()
+                         link_preview_options={"is_disabled": True}, **options)
 
 
 class Bot:
@@ -187,51 +103,65 @@ class Bot:
         message = update.get("message", {})
         chat, user = message.get("chat", {}), message.get("from", {})
         if message.get("migrate_to_chat_id"):
-            self.store.move_chat(chat["id"], message["migrate_to_chat_id"])
-            return
+            self.store.move_chat(chat["id"], message["migrate_to_chat_id"]); return
         if user.get("is_bot") or chat.get("type") not in {"private", "group", "supergroup"}:
             return
-        text = message.get("text", "").split()
-        if not text or not text[0].startswith("/"):
-            return
-        command, _, mention = text[0].partition("@")
-        if mention and mention.casefold() != self.username.casefold():
-            return
-        command = command.lower()
-        if command not in {"/start", "/connect", "/stop", "/help"}:
-            return
+        parts = message.get("text", "").split()
+        if not parts or not parts[0].startswith("/"): return
+        command, _, mention = parts[0].partition("@")
+        if mention and mention.casefold() != self.username.casefold(): return
+        command = command.casefold()
+        allowed = {"/start","/connect","/stop","/help","/code","/subscribe","/unsubscribe","/subscriptions"}
+        if command not in allowed: return
         private = chat["type"] == "private"
         if command == "/help" or (command == "/start" and not private):
-            self.telegram.send(chat["id"], "partizan уведомляет о контроле присутствия. "
-                               "Личный чат: /connect. Группа: администратор вводит /connect. "
-                               "Отключить этот чат: /stop.")
+            self.telegram.send(chat["id"], "partizan: /connect — подключить приложение, /code — код автора, "
+                "/subscribe 0123 — подписаться, /subscriptions — список, /unsubscribe 0123 — отписаться, /stop — отключить этот чат.")
             return
         if not private:
             admins = self.telegram.call("getChatAdministrators", chat_id=chat["id"])
             if not any(member["user"]["id"] == user.get("id") for member in admins):
-                self.telegram.send(chat["id"], "Подключить или отключить группу может её администратор.")
-                return
+                self.telegram.send(chat["id"], "Настройки группы меняет её администратор."); return
+        label = chat.get("title") or chat.get("first_name") or ""
         if command == "/stop":
             self.store.disable(chat["id"])
-            self.telegram.send(chat["id"], "Уведомления для этого чата отключены. Подключить снова: /connect.")
-            return
-        key = self.store.connection_key(chat["id"])
-        label = "личного чата" if private else "группы"
-        credentials = (f"Фраза подключения {label} partizan:\n\n{key}\n\n"
-                       "В приложении откройте настройки, введите эту фразу и включите Telegram. Фраза разрешает отправку только в этот чат. "
-                       "Для отключения: /stop в соответствующем чате.")
-        if private:
-            self.telegram.send(chat["id"], credentials)
-        else:
+            self.telegram.send(chat["id"], "Этот чат отключён, подписки удалены. Подключить приложение: /connect; подписаться: /subscribe 0123."); return
+        if command == "/code":
+            code = self.store.publisher_code(chat["id"], label)
+            self.telegram.send(chat["id"], f"Код автора: {code}\nДля подписки отправьте боту /subscribe {code}. Это публичный код получения уведомлений, не пароль отправителя."); return
+        if command == "/subscriptions":
+            rows = self.store.subscriptions(chat["id"])
+            self.telegram.send(chat["id"], "\n".join(f"{code} · {name}" for code,name in rows) if rows else "Подписок нет. Добавить: /subscribe 0123."); return
+        if command in {"/subscribe","/unsubscribe"}:
+            if len(parts) != 2 or not re.fullmatch(r"[0-9]{4}", parts[1]):
+                self.telegram.send(chat["id"], f"Укажите четыре цифры: {command} 0123"); return
             try:
-                self.telegram.send(user["id"], credentials)
-            except TelegramError as error:
-                if error.code not in {400, 403}:
-                    raise
-                self.telegram.send(chat["id"], "Сначала откройте личный чат со мной и нажмите /start, "
-                                   "затем повторите /connect в группе. Фраза в группу не публикуется.")
-                return
-            self.telegram.send(chat["id"], "Фраза подключения группы отправлен администратору в личный чат.")
+                if command == "/subscribe":
+                    name = self.store.subscribe(chat["id"], parts[1])
+                    reply = f"Подписка на {name} · {parts[1]} включена. Просьбы о входе, личные ошибки и тесты не пересылаются."
+                else:
+                    self.store.unsubscribe(chat["id"], parts[1]); reply = "Подписка удалена."
+            except LookupError:
+                reply = "Такого кода подписки нет."
+            self.telegram.send(chat["id"], reply); return
+        pairing = self.store.issue_pairing(chat["id"], label)
+        prefix = "Одноразовая фраза подключения partizan:\n\n"
+        phrase = pairing["phrase"]
+        text = (prefix + phrase + "\n\nВведите её в приложении в течение 5 минут. "
+                "Фраза подключает одно приложение; новое подключение отзывает прежний ключ.\n"
+                f"Код для подписчиков: {pairing['code']} — команда /subscribe {pairing['code']}.\n"
+                "Сообщение будет удалено после использования или через 5 минут.")
+        recipient = chat["id"] if private else user["id"]
+        try:
+            sent = self.telegram.send(recipient, text, entities=[{
+                "type":"spoiler","offset":len(prefix.encode("utf-16-le"))//2,
+                "length":len(phrase.encode("utf-16-le"))//2}])
+            self.store.track_message(recipient, sent["message_id"], phrase)
+        except TelegramError as error:
+            if private or error.code not in {400,403}: raise
+            self.telegram.send(chat["id"], "Сначала откройте личный чат со мной и нажмите /start, затем повторите /connect в группе. Фраза в группу не публикуется."); return
+        if not private:
+            self.telegram.send(chat["id"], "Одноразовая фраза отправлена администратору в личный чат.")
 
     def poll(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -278,46 +208,49 @@ def handler_for(store: Store, telegram: Telegram):
                 self.reply(404, ok=False)
 
         def do_POST(self):
-            if self.path not in {"/v1/attendance", "/partizan_agent"}:
+            if self.path not in {"/v1/attendance", "/partizan_agent", "/partizan_agent/connect"}:
                 return self.reply(404, ok=False)
             if telegram is None:
                 return self.reply(503, ok=False, error="telegram_disabled")
-            authorization = self.headers.get("Authorization", "")
-            if not authorization.startswith("Bearer ") or not 8 <= len(authorization[7:]) <= 256:
-                return self.reply(401, ok=False, error="invalid_key")
-            try:
-                key = authorization_key(authorization[7:])
-            except (ValueError, UnicodeError):
-                return self.reply(401, ok=False, error="invalid_key")
             if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
                 return self.reply(400, ok=False, error="expected_json")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                return self.reply(400, ok=False, error="invalid_length")
-            if not 1 <= length <= 4096:
-                return self.reply(413, ok=False, error="body_too_large")
-            try:
+                if not 1 <= length <= 4096: return self.reply(413, ok=False, error="body_too_large")
                 event = json.loads(self.rfile.read(length))
-                if not isinstance(event, dict) or set(event) != {"event_id", "kind", "title", "body"}:
-                    raise ValueError
-                if event["kind"] not in {"attendance_required", "test"}:
-                    raise ValueError
-                if not isinstance(event["event_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", event["event_id"]):
-                    raise ValueError
-                if any(not isinstance(event[k], str) or not 1 <= len(event[k]) <= 1000 for k in ("title", "body")):
-                    raise ValueError
-            except (ValueError, TypeError, KeyError):
+                if not isinstance(event, dict): raise ValueError
+            except (ValueError,TypeError):
+                return self.reply(400, ok=False, error="invalid_json")
+            if self.path == "/partizan_agent/connect":
+                if not store.allow_claim(self.client_address[0]):
+                    return self.reply(429, ok=False, error="pairing_rate_limited")
+                try:
+                    if set(event) != {"phrase","client_id"}: raise ValueError
+                    paired = store.claim(event["phrase"], event["client_id"])
+                except PermissionError:
+                    return self.reply(401, ok=False, error="phrase_expired_or_used")
+                except ValueError:
+                    return self.reply(400, ok=False, error="invalid_pairing")
+                return self.reply(200, ok=True, **paired)
+            authorization = self.headers.get("Authorization", "")
+            client_id = self.headers.get("X-Partizan-Client", "")
+            if not re.fullmatch(r"Bearer [A-Za-z0-9_-]{43}", authorization) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", client_id):
+                return self.reply(401, ok=False, error="pairing_required")
+            try:
+                if not {"event_id","kind","title","body"} <= set(event) or set(event) - {"event_id","kind","title","body","scope","signal"}: raise ValueError
+                if event["kind"] not in SHARED_KINDS | PERSONAL_KINDS: raise ValueError
+                if not isinstance(event["event_id"],str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",event["event_id"]): raise ValueError
+                if any(not isinstance(event[k],str) or not 1 <= len(event[k]) <= 1000 for k in ("title","body")): raise ValueError
+                if not isinstance(event.get("scope",""),str) or not re.fullmatch(r"(?:[0-9a-f]{64})?",event.get("scope","")): raise ValueError
+                if not isinstance(event.get("signal",""),str) or not re.fullmatch(r"[A-Za-z0-9_-]{0,32}",event.get("signal","")): raise ValueError
+            except (ValueError,TypeError,KeyError):
                 return self.reply(400, ok=False, error="invalid_event")
             try:
-                duplicate = store.deliver(key, event["event_id"],
-                                          event["title"] + "\n\n" + event["body"], telegram)
-            except PermissionError:
-                return self.reply(401, ok=False, error="invalid_key")
-            except LookupError:
-                return self.reply(410, ok=False, error="chat_disabled")
-            except TelegramError:
-                return self.reply(502, ok=False, error="telegram_delivery_failed")
+                duplicate = store.deliver(authorization[7:], event["event_id"], event["title"]+"\n\n"+event["body"], telegram,
+                    client_id=client_id,kind=event["kind"],scope=event.get("scope",""),signal=event.get("signal",""))
+            except PermissionError: return self.reply(401, ok=False, error="invalid_publisher")
+            except LookupError: return self.reply(410, ok=False, error="publisher_disabled")
+            except TelegramError: return self.reply(502, ok=False, error="telegram_delivery_failed")
             self.reply(200, ok=True, duplicate=duplicate)
     return Handler
 
@@ -329,6 +262,12 @@ class Server(ThreadingHTTPServer):
         connection, address = super().get_request()
         connection.settimeout(10)
         return connection, address
+
+
+def maintain_messages(telegram, store, stop):
+    while not stop.is_set():
+        store.cleanup(telegram)
+        stop.wait(5)
 
 
 def main() -> int:
@@ -354,8 +293,10 @@ def main() -> int:
     bot = Bot(telegram, store, me["username"])
     polling = threading.Thread(target=bot.poll, args=(stop,), daemon=True)
     http = threading.Thread(target=server.serve_forever, daemon=True)
+    cleanup = threading.Thread(target=maintain_messages, args=(telegram,store,stop), daemon=True)
     polling.start()
     http.start()
+    cleanup.start()
     print(f"@{me['username']} запущен; API: http://{host}:{port}. Откройте личный чат и нажмите /start.", flush=True)
     try:
         while not stop.wait(1):
@@ -367,8 +308,9 @@ def main() -> int:
         server.shutdown()
         server.server_close()
         polling.join(timeout=1)
+        cleanup.join(timeout=1)
         # A pending long poll owns the store until the daemon exits.
-        if not polling.is_alive():
+        if not polling.is_alive() and not cleanup.is_alive():
             store.close()
     return 0
 
